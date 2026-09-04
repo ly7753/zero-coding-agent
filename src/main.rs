@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Cursor, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
@@ -168,6 +168,12 @@ Operating Principles:
    - If verification fails with a non-zero exit code, examine stderr/stdout, diagnose the root cause, apply corrective edits, and re-run verification until passing (up to 3 attempts).
 5. Safety: All modifications are version-backed. Use `rollback` if an edit breaks irrevocably.
 **CRITICAL**: You MUST specify a positive 'timeout' (in milliseconds) for EVERY tool call."#;
+
+fn get_system_instruction() -> String {
+    std::env::var("CUSTOM_SYSTEM_PROMPT")
+        .or_else(|_| std::env::var("SYSTEM_PROMPT"))
+        .unwrap_or_else(|_| SYSTEM_INSTRUCTION.to_string())
+}
 
 fn get_common_tool_specs() -> Vec<Value> {
     json!([
@@ -1029,8 +1035,6 @@ async fn execute_actual_tool(name: &str, args: &Value, state: &AppState) -> Resu
             // 阶段一：全量验证，防止部分成功破坏代码一致性
             struct PlannedEdit {
                 path: String,
-                old_str: String,
-                new_str: String,
                 updated_content: String,
             }
 
@@ -1056,8 +1060,6 @@ async fn execute_actual_tool(name: &str, args: &Value, state: &AppState) -> Resu
                 let updated = norm_content.replacen(&norm_old, &new_str.replace("\r\n", "\n"), 1);
                 planned_writes.push(PlannedEdit {
                     path: path_str.to_string(),
-                    old_str: old_str.to_string(),
-                    new_str: new_str.to_string(),
                     updated_content: updated,
                 });
             }
@@ -1232,7 +1234,6 @@ async fn execute_actual_tool(name: &str, args: &Value, state: &AppState) -> Resu
 async fn execute_tool_handler(name: &str, args: &Value, state: &AppState) -> Result<Value, String> {
     let mut plan = state.plan.lock().await;
 
-    // 如果处于 Plan 模式，拦截写操作工具进行暂存
     if plan.enabled {
         let is_mutation_tool = matches!(
             name,
@@ -1430,7 +1431,7 @@ fn build_responses_request(
     let mut req = json!({
         "model": model,
         "input": sanitize_history_responses(history),
-        "instructions": SYSTEM_INSTRUCTION,
+        "instructions": get_system_instruction(),
         "tools": get_responses_tools(include_web_search),
         "parallel_tool_calls": true,
         "reasoning": { "effort": reasoning_effort },
@@ -1439,6 +1440,18 @@ fn build_responses_request(
         "top_p": 1,
         "stream": true
     });
+
+    if let Ok(temp) = std::env::var("CUSTOM_TEMPERATURE") {
+        if let Ok(val) = temp.parse::<f64>() {
+            req["temperature"] = json!(val);
+        }
+    }
+
+    if let Ok(tp) = std::env::var("CUSTOM_TOP_P") {
+        if let Ok(val) = tp.parse::<f64>() {
+            req["top_p"] = json!(val);
+        }
+    }
 
     if let Ok(fmt) = std::env::var("TEXT_FORMAT") {
         if fmt == "json_object" {
@@ -1464,15 +1477,29 @@ fn build_responses_request(
 }
 
 fn build_anthropic_request(history: &[Value], model: &str, max_tokens: u64) -> Value {
-    json!({
+    let mut req = json!({
         "model": model,
         "max_tokens": max_tokens,
-        "system": SYSTEM_INSTRUCTION,
+        "system": get_system_instruction(),
         "messages": sanitize_history_anthropic(history),
         "tools": get_anthropic_tools(),
         "stream": true,
         "thinking": { "type": "enabled" }
-    })
+    });
+
+    if let Ok(temp) = std::env::var("CUSTOM_TEMPERATURE") {
+        if let Ok(val) = temp.parse::<f64>() {
+            req["temperature"] = json!(val);
+        }
+    }
+
+    if let Ok(tp) = std::env::var("CUSTOM_TOP_P") {
+        if let Ok(val) = tp.parse::<f64>() {
+            req["top_p"] = json!(val);
+        }
+    }
+
+    req
 }
 
 // ==========================================
@@ -1866,47 +1893,97 @@ fn expand_file_references(text: &str) -> String {
 }
 
 // ==========================================
-// 12. 交互中枢与主循环
+// 12. 自定义功能与协议端点解析
 // ==========================================
+fn apply_custom_headers(mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Ok(headers_str) = std::env::var("CUSTOM_HEADERS") {
+        let trimmed = headers_str.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
+                for (k, v) in map {
+                    if let Some(s) = v.as_str() {
+                        builder = builder.header(k, s);
+                    }
+                }
+            }
+        } else {
+            for item in trimmed.split(',') {
+                let mut parts = item.splitn(2, ':');
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    let k = k.trim();
+                    let v = v.trim();
+                    if !k.is_empty() && !v.is_empty() {
+                        builder = builder.header(k, v);
+                    }
+                }
+            }
+        }
+    }
+    builder
+}
 
 fn get_protocol_config(protocol: Protocol) -> Result<(String, String), String> {
+    let custom_endpoint = std::env::var("CUSTOM_ENDPOINT").ok();
+    let custom_key = std::env::var("CUSTOM_API_KEY")
+        .or_else(|_| std::env::var("AI_API_KEY"))
+        .ok();
+    let custom_base = std::env::var("CUSTOM_BASE_URL")
+        .or_else(|_| std::env::var("AI_BASE_URL"))
+        .ok();
+
     match protocol {
         Protocol::Anthropic => {
             let key = std::env::var("ANTHROPIC_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .map_err(|_| "未配置 ANTHROPIC_API_KEY 环境变量".to_string())?
+                .ok()
+                .or(custom_key)
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .ok_or_else(|| "未配置 API 密钥，请设置 ANTHROPIC_API_KEY、CUSTOM_API_KEY 或 OPENAI_API_KEY".to_string())?
                 .trim()
                 .to_string();
 
-            let base = std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-            let trimmed = base.trim().trim_end_matches('/');
-
-            let endpoint = if trimmed.ends_with("/v1/messages") {
-                trimmed.to_string()
-            } else if trimmed.ends_with("/v1") {
-                format!("{}/messages", trimmed)
+            let endpoint = if let Some(ep) = custom_endpoint {
+                ep.trim().to_string()
             } else {
-                format!("{}/v1/messages", trimmed)
+                let base = std::env::var("ANTHROPIC_BASE_URL")
+                    .ok()
+                    .or(custom_base)
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+                let trimmed = base.trim().trim_end_matches('/');
+
+                if trimmed.ends_with("/v1/messages") {
+                    trimmed.to_string()
+                } else if trimmed.ends_with("/v1") {
+                    format!("{}/messages", trimmed)
+                } else {
+                    format!("{}/v1/messages", trimmed)
+                }
             };
 
             Ok((key, endpoint))
         }
         Protocol::Responses => {
             let key = std::env::var("OPENAI_API_KEY")
-                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-                .map_err(|_| "未配置 OPENAI_API_KEY 环境变量".to_string())?
+                .ok()
+                .or(custom_key)
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| "未配置 API 密钥，请设置 OPENAI_API_KEY、CUSTOM_API_KEY 或 ANTHROPIC_API_KEY".to_string())?
                 .trim()
                 .to_string();
 
-            let base = std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
-            let trimmed = base.trim().trim_end_matches('/');
-
-            let endpoint = if trimmed.ends_with("/responses") {
-                trimmed.to_string()
+            let endpoint = if let Some(ep) = custom_endpoint {
+                ep.trim().to_string()
             } else {
-                format!("{}/responses", trimmed)
+                let base = std::env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .or(custom_base)
+                    .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+                let trimmed = base.trim().trim_end_matches('/');
+
+                if trimmed.ends_with("/responses") {
+                    trimmed.to_string()
+                } else {
+                    format!("{}/responses", trimmed)
+                }
             };
 
             Ok((key, endpoint))
@@ -1914,6 +1991,9 @@ fn get_protocol_config(protocol: Protocol) -> Result<(String, String), String> {
     }
 }
 
+// ==========================================
+// 13. 交互中枢与主循环
+// ==========================================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
@@ -1921,14 +2001,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_protocol = std::env::var("AI_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
     let mut current_protocol = Protocol::from_str(&raw_protocol);
 
-    if std::env::var("ANTHROPIC_API_KEY").is_err() && std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("\x1b[31m❌ 错误: 请在环境变量中配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY\x1b[0m");
+    let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok()
+        || std::env::var("CUSTOM_API_KEY").is_ok()
+        || std::env::var("AI_API_KEY").is_ok();
+    if !has_key {
+        eprintln!("\x1b[31m❌ 错误: 未检测到 API 密钥，请在环境变量中配置 ANTHROPIC_API_KEY、OPENAI_API_KEY 或 CUSTOM_API_KEY\x1b[0m");
         std::process::exit(1);
     }
 
-    let model = std::env::var("MODEL_NAME")
+    let model = std::env::var("CUSTOM_MODEL")
+        .or_else(|_| std::env::var("MODEL_NAME"))
         .or_else(|_| std::env::var("AI_MODEL"))
         .unwrap_or_else(|_| "deepseek-v4-flash-vision-exp".to_string());
+
     let reasoning_effort = std::env::var("REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string());
     let max_retries = std::env::var("MAX_RETRIES").unwrap_or_else(|_| "3".to_string()).parse::<usize>().unwrap_or(3);
     let max_output_tokens = std::env::var("MAX_OUTPUT_TOKENS").unwrap_or_else(|_| "8192".to_string()).parse::<u64>().unwrap_or(8192);
@@ -2218,6 +2304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .header("Authorization", format!("Bearer {}", api_key))
                         .header("User-Agent", "OpenAI/NodeJS");
                 }
+
+                req_builder = apply_custom_headers(req_builder);
 
                 let res = req_builder.send().await;
 
