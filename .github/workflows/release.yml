@@ -58,6 +58,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # 快速安装 cross（避免每次跑 CI 从源码编译）
       - name: Install Cross
         if: matrix.use_cross
         uses: taiki-e/install-action@cross
@@ -71,20 +72,46 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
+      # ─── Unix 打包：收集二进制 + 辅助文件 ───
       - name: Package Archive (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           ARCHIVE_NAME="zero-coding-agent-${{ matrix.target }}.tar.gz"
-          tar -czf "${ARCHIVE_NAME}" -C "target/${{ matrix.target }}/release" "${{ matrix.bin_name }}"
+          STAGING="dist"
+          mkdir -p "${STAGING}"
+
+          # 1. 放入二进制
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${STAGING}/"
+
+          # 2. 放入辅助文件（容错复制：存在就打包，没有也不报错）
+          cp -f README* LICENSE* LICENCE* "${STAGING}/" 2>/dev/null || true
+          # 如果有示例配置文件，取消下面注释：
+          # cp -f config.example.* "${STAGING}/" 2>/dev/null || true
+
+          # 3. 压缩暂存区的所有内容
+          tar -czf "${ARCHIVE_NAME}" -C "${STAGING}" .
           echo "ASSET_PATH=${ARCHIVE_NAME}" >> $GITHUB_ENV
 
+      # ─── Windows 打包：收集二进制 + 辅助文件 ───
       - name: Package Archive (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ArchiveName = "zero-coding-agent-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath $ArchiveName
+          $Staging = "dist"
+          New-Item -ItemType Directory -Force -Path $Staging
+
+          # 1. 放入二进制
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination $Staging
+
+          # 2. 放入辅助文件（容错复制）
+          Get-Item -Path "README*", "LICENSE*", "LICENCE*" -ErrorAction SilentlyContinue | Copy-Item -Destination $Staging
+          # 如果有示例配置：
+          # Get-Item -Path "config.example.*" -ErrorAction SilentlyContinue | Copy-Item -Destination $Staging
+
+          # 3. 压缩为 zip
+          Compress-Archive -Path "$Staging/*" -DestinationPath $ArchiveName
           echo "ASSET_PATH=$ArchiveName" >> $env:GITHUB_ENV
 
       - name: Upload Artifact
@@ -108,9 +135,8 @@ jobs:
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          # 如果通过 tag 触发，使用 tag 名；如果是 push 到 main 或手动运行，使用 "latest"
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Latest Release' }}
-          make_latest: true     # 强制将此版本标记为仓库首页的 "Latest"
+          make_latest: true
           prerelease: false
           files: release-assets/*

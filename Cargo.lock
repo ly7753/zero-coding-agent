@@ -1334,27 +1334,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_agent"
-version = "0.2.1"
-dependencies = [
- "base64",
- "bytes",
- "calamine",
- "chrono",
- "docx-rs",
- "dotenvy",
- "futures-util",
- "image",
- "pdf-extract",
- "regex",
- "reqwest",
- "rustyline",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,6 +2160,27 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "zero-coding-agent"
+version = "0.2.1"
+dependencies = [
+ "base64",
+ "bytes",
+ "calamine",
+ "chrono",
+ "docx-rs",
+ "dotenvy",
+ "futures-util",
+ "image",
+ "pdf-extract",
+ "regex",
+ "reqwest",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
