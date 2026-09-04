@@ -1868,6 +1868,52 @@ fn expand_file_references(text: &str) -> String {
 // ==========================================
 // 12. 交互中枢与主循环
 // ==========================================
+
+fn get_protocol_config(protocol: Protocol) -> Result<(String, String), String> {
+    match protocol {
+        Protocol::Anthropic => {
+            let key = std::env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .map_err(|_| "未配置 ANTHROPIC_API_KEY 环境变量".to_string())?
+                .trim()
+                .to_string();
+
+            let base = std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+            let trimmed = base.trim().trim_end_matches('/');
+
+            let endpoint = if trimmed.ends_with("/v1/messages") {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1") {
+                format!("{}/messages", trimmed)
+            } else {
+                format!("{}/v1/messages", trimmed)
+            };
+
+            Ok((key, endpoint))
+        }
+        Protocol::Responses => {
+            let key = std::env::var("OPENAI_API_KEY")
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .map_err(|_| "未配置 OPENAI_API_KEY 环境变量".to_string())?
+                .trim()
+                .to_string();
+
+            let base = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+            let trimmed = base.trim().trim_end_matches('/');
+
+            let endpoint = if trimmed.ends_with("/responses") {
+                trimmed.to_string()
+            } else {
+                format!("{}/responses", trimmed)
+            };
+
+            Ok((key, endpoint))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
@@ -1875,13 +1921,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_protocol = std::env::var("AI_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
     let mut current_protocol = Protocol::from_str(&raw_protocol);
 
-    let base_url = std::env::var("OPENAI_BASE_URL")
-        .or_else(|_| std::env::var("AI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
-    let raw_api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("AI_API_KEY"))
-        .expect("请在 .env 中配置 OPENAI_API_KEY 或 AI_API_KEY");
-    let api_key = raw_api_key.trim().to_string();
+    if std::env::var("ANTHROPIC_API_KEY").is_err() && std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("\x1b[31m❌ 错误: 请在环境变量中配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY\x1b[0m");
+        std::process::exit(1);
+    }
+
     let model = std::env::var("MODEL_NAME")
         .or_else(|_| std::env::var("AI_MODEL"))
         .unwrap_or_else(|_| "deepseek-v4-flash-vision-exp".to_string());
@@ -2134,10 +2178,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut total_input, mut total_output, mut total_cached) = (0u64, 0u64, 0u64);
         let start_time = Instant::now();
 
-        let endpoint = if current_protocol == Protocol::Anthropic {
-            format!("{}/anthropic/v1/messages", base_url.trim_end_matches('/'))
-        } else {
-            format!("{}/responses", base_url.trim_end_matches('/'))
+        let (api_key, endpoint) = match get_protocol_config(current_protocol) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("\x1b[31m❌ 协议配置错误: {}\x1b[0m", e);
+                continue;
+            }
         };
 
         loop {
@@ -2158,14 +2204,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for attempt in 0..max_retries {
                 let mut req_builder = client
                     .post(&endpoint)
-                    .header("Authorization", format!("Bearer {}", api_key))
                     .header("Content-Type", "application/json")
                     .header("Accept", "text/event-stream")
-                    .header("User-Agent", "OpenAI/NodeJS")
                     .json(&req_payload);
 
                 if current_protocol == Protocol::Anthropic {
-                    req_builder = req_builder.header("anthropic-version", "2023-06-01");
+                    req_builder = req_builder
+                        .header("x-api-key", &api_key)
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("anthropic-version", "2023-06-01");
+                } else {
+                    req_builder = req_builder
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .header("User-Agent", "OpenAI/NodeJS");
                 }
 
                 let res = req_builder.send().await;
