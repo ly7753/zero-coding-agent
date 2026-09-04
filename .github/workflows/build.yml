@@ -1,0 +1,102 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1. Linux x86_64 (纯静态 MUSL)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin_name: zero-coding-agent
+            use_cross: true
+
+          # 2. Linux ARM64 (纯静态 MUSL)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin_name: zero-coding-agent
+            use_cross: true
+
+          # 3. macOS ARM64 (Apple Silicon M系列，已剔除 x86_64 Darwin)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin_name: zero-coding-agent
+            use_cross: false
+
+          # 4. Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: zero-coding-agent.exe
+            use_cross: false
+
+          # 5. Windows ARM64 (已新增)
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            bin_name: zero-coding-agent.exe
+            use_cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Cross (for MUSL & ARM cross-compile)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Release Binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package Archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="zero-coding-agent-${{ matrix.target }}.tar.gz"
+          tar -czf "${ARCHIVE_NAME}" -C "target/${{ matrix.target }}/release" "${{ matrix.bin_name }}"
+          echo "ASSET_PATH=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Package Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ArchiveName = "zero-coding-agent-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath $ArchiveName
+          echo "ASSET_PATH=$ArchiveName" >> $env:GITHUB_ENV
+
+      # 每次 push 到 main 自动保存构件
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-coding-agent-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+
+      # 打 tag (v*) 时自动发布到 Release
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
