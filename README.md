@@ -3,20 +3,20 @@
 [![Tokio](https://img.shields.io/badge/async-tokio-blue.svg)](https://tokio.rs/)
 [![Version](https://img.shields.io/badge/version-0.2.1-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-`zero-coding-agent` 是一款基于纯 Rust 构建的极速、高韧性自主编程智能体（Autonomous Engineering Agent）。支持 **DeepSeek Responses** 与 **Anthropic Messages** 双协议流式交互，集成了统一补丁（Unified Diff）应用、行级精准读写、命令实时流式捕获、无锁原子修改、多版本快照撤销（Auto-Backup & Undo）、规划拦截模式（Plan Mode）以及多模态文档与图像本地解析能力。
+`zero-coding-agent` 是一款基于纯 Rust 构建的极速、高韧性自主编程智能体（Autonomous Engineering Agent）。支持 **OpenAI Responses** 与 **Anthropic Messages** 双官方标准协议流式交互，集成了统一补丁（Unified Diff）应用、行级精准读写、命令实时流式捕获、无锁原子修改、多版本快照撤销（Auto-Backup & Undo）、规划拦截模式（Plan Mode）以及多模态文档与图像本地解析能力。
 ---
 ## 🌟 核心特性
 - **双协议原生支持 (Dual-Protocol Architecture)**
-  - **DeepSeek Responses 原生协议**：完整适配 `response.*` 规范、SSE 思考链（Reasoning Delta）流式输出、并行 Function Calling 及原生 Web Search。
-  - **Anthropic Messages 协议**：原生支持 Claude 系列 `thinking` 思维流、`tool_use` / `tool_result` 状态流式解析与规范端点鉴权。
+  - **OpenAI Responses 协议**：完整适配 `response.*` 规范、SSE 思考链流式输出、并行 Function Calling 及原生 Web Search。
+  - **Anthropic Messages 协议**：原生支持 Claude 系列 `thinking` 思维流与 `budget_tokens` 控制、`tool_use` / `tool_result` 状态流式解析与规范端点鉴权。
   - **协议热切换**：交互终端内输入 `/protocol` 即可实时无缝切换协议。
 - **工业级自主工程闭环 (Agentic Auto-Heal)**
   - **探索与定位**：内置 `ls_tree`（带递归深度控制与智能黑名单过滤）和纯 Rust 高性能正则 `grep_search`。
   - **原子代码修改**：
     - `edit_file`：单文件唯一匹配替换，杜绝歧义覆盖。
     - `multi_replace`：跨多文件原子校验与全量置换，任意一处上下文失效即整体事务性回滚。
-    - `apply_diff` / `apply_patch`：完整解析 Unified Diff（`diff -u` / `git diff`），内置容错滑动匹配窗口（Tolerance Window）。
-  - **闭环验证与自动修复**：代码修改后调用 `exec_command` 执行构建和测试（如 `cargo check`、`cargo test`、`pytest`）；若报错，智能体自动诊断 stderr 并发起多轮自愈修复（Auto-Heal）。
+    - `apply_diff` / `apply_patch`：完整解析 Unified Diff（`diff -u` / `git diff`），内置容错滑动匹配窗口。
+  - **闭环验证与自动修复**：代码修改后调用 `exec_command` 执行构建和测试（如 `cargo check`、`cargo test`、`pytest`）；若报错，智能体自动诊断 stderr 并发起多轮自愈修复。
 - **全方位安全与撤销机制 (Safety & Staging)**
   - **自动版本备份**：所有修改操作在落盘前自动于 `.agent_backups/` 生成时间戳级备份，单个文件保留最近 20 个历史版本。
   - **即时撤销**：提供 `/undo <path>` 指令与 `rollback` 工具，随时回滚至上一次快照。
@@ -28,7 +28,7 @@
     - **Word (.docx)**：基于 `docx-rs` 遍历段落与文本节点。
     - **Excel / CSV (.xlsx, .xls, .csv)**：基于 `calamine` 纯 Rust 解析各工作表数据并结构化拼接。
 - **增强型 REPL 终端体验**
-  - **智能多行判定**：自动检测未闭合括号（`()`、`[]`、`{}`）、未闭合引号（`'`、`"`、`` ` ``）以及行尾反斜杠 `\` 转义，智能在 `>>> ` 与 `... ` 续行模式间切换。
+  - **智能多行判定**：自动检测未闭合括号、未闭合引号以及行尾反斜杠转义，智能在 `>>> ` 与 `... ` 续行模式间切换。
   - **宏指令支持**：支持 `@path/to/file` 语法在 Prompt 中就地展开文件完整文本。
   - **会话持久化与管理**：会话历史原子化保存至 `sessions/`，提供完整列表浏览、断点恢复与消息完整度检查。
 ---
@@ -36,13 +36,15 @@
 
 | 变量名 | 说明 | 默认值 / 示例 |
 | :--- | :--- | :--- |
-| `AI_PROTOCOL` | 协议类型（`openai` / `responses` 或 `anthropic` / `claude`） | `openai` |
-| `ANTHROPIC_API_KEY` | Anthropic / Claude 官方 API 密钥 | - |
-| `ANTHROPIC_BASE_URL` | Anthropic / Claude 基础地址 | `https://api.anthropic.com` |
-| `OPENAI_API_KEY` | OpenAI / DeepSeek 官方 API 密钥 | - |
-| `OPENAI_BASE_URL` | OpenAI / DeepSeek 基础地址 | `https://api.deepseek.com` |
-| `MODEL_NAME` / `AI_MODEL` | 模型名称 | `deepseek-v4-flash-vision-exp` |
-| `REASONING_EFFORT` | 思考模型推理预算强度（`low` / `medium` / `high`） | `medium` |
+| `PROTOCOL` | 协议类型（`responses` / `openai` 或 `anthropic` / `claude`） | `responses` |
+| `OPENAI_API_KEY` | OpenAI 官方 API 密钥（Responses 协议必需） | - |
+| `OPENAI_BASE_URL` | OpenAI 基础地址 | `https://api.openai.com` |
+| `ANTHROPIC_API_KEY` | Anthropic 官方 API 密钥（Anthropic 协议必需） | - |
+| `ANTHROPIC_BASE_URL` | Anthropic 基础地址 | `https://api.anthropic.com` |
+| `ANTHROPIC_THINKING_BUDGET` | Anthropic 思考 Token 预算（范围: 1024 ~ max_tokens*0.8） | `max_tokens / 2` |
+| `ANTHROPIC_DISABLE_THINKING` | 设为 `true` 禁用 Anthropic 思维链 | `false` |
+| `MODEL_NAME` | 模型名称 | `gpt-4o` 或 `claude-3-7-sonnet-20250219` |
+| `REASONING_EFFORT` | OpenAI Reasoning 预算强度（`low` / `medium` / `high` 等） | `medium` |
 | `MAX_OUTPUT_TOKENS` | 单次最大输出 Token | `64000` |
 | `MAX_RETRIES` | 接口网络抖动重试次数 | `3` |
 | `ENABLE_WEB_SEARCH` | 是否开启联网搜索组件（Responses 协议原生） | `true` |
@@ -52,7 +54,6 @@
 | `TEXT_SCHEMA_NAME` | 当指定 `json_schema` 时的 Schema 标识名 | `custom_schema` |
 | `TEXT_SCHEMA` | 当指定 `json_schema` 时的 JSON 约束定义对象 | - |
 | `USER_ID` | 终端用户透传标识 | - |
-| `TOP_LOGPROBS` | 对数概率采样维度 (1~20) | - |
 | `SHELL` | Windows 下执行终端程序（`powershell` 或 `cmd`） | `powershell` |
 
 ---
