@@ -169,12 +169,6 @@ Operating Principles:
 5. Safety: All modifications are version-backed. Use `rollback` if an edit breaks irrevocably.
 **CRITICAL**: You MUST specify a positive 'timeout' (in milliseconds) for EVERY tool call."#;
 
-fn get_system_instruction() -> String {
-    std::env::var("CUSTOM_SYSTEM_PROMPT")
-        .or_else(|_| std::env::var("SYSTEM_PROMPT"))
-        .unwrap_or_else(|_| SYSTEM_INSTRUCTION.to_string())
-}
-
 fn get_common_tool_specs() -> Vec<Value> {
     json!([
         {
@@ -770,12 +764,29 @@ const IMAGE_MAX_DIM_DEFAULT: u32 = 1600;
 const IMAGE_JPEG_QUALITY_DEFAULT: u8 = 82;
 const MAX_IMAGE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
+fn get_configured_image_max_dim() -> u32 {
+    std::env::var("IMAGE_MAX_DIM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(IMAGE_MAX_DIM_DEFAULT)
+}
+
+fn get_configured_image_jpeg_quality() -> u8 {
+    std::env::var("IMAGE_JPEG_QUALITY")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|&q| (1..=100).contains(&q))
+        .unwrap_or(IMAGE_JPEG_QUALITY_DEFAULT)
+}
+
 fn compress_image(data: &[u8]) -> Result<(Vec<u8>, String), String> {
     let format = image::guess_format(data).map_err(|e| format!("无法识别图片格式: {}", e))?;
     let img = image::load_from_memory(data).map_err(|e| format!("解码图片失败: {}", e))?;
     let (orig_w, orig_h) = (img.width(), img.height());
 
-    let mut current_max_dim = IMAGE_MAX_DIM_DEFAULT;
+    let mut current_max_dim = get_configured_image_max_dim();
+    let quality = get_configured_image_jpeg_quality();
+
     loop {
         let longest = std::cmp::max(orig_w, orig_h);
         let ratio = current_max_dim as f32 / longest as f32;
@@ -803,7 +814,7 @@ fn compress_image(data: &[u8]) -> Result<(Vec<u8>, String), String> {
         } else {
             let rgb = resized.to_rgb8();
             let mut jpeg = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, IMAGE_JPEG_QUALITY_DEFAULT);
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
             encoder
                 .encode_image(&image::DynamicImage::ImageRgb8(rgb))
                 .map_err(|e| format!("编码 JPEG 失败: {}", e))?;
@@ -1032,7 +1043,7 @@ async fn execute_actual_tool(name: &str, args: &Value, state: &AppState) -> Resu
                 return Err("The 'edits' array cannot be empty".to_string());
             }
 
-            // 阶段一：全量验证，防止部分成功破坏代码一致性
+            // 阶段一：全量验证，移除未使用的 old_str/new_str 字段消除告警
             struct PlannedEdit {
                 path: String,
                 updated_content: String,
@@ -1431,7 +1442,7 @@ fn build_responses_request(
     let mut req = json!({
         "model": model,
         "input": sanitize_history_responses(history),
-        "instructions": get_system_instruction(),
+        "instructions": SYSTEM_INSTRUCTION,
         "tools": get_responses_tools(include_web_search),
         "parallel_tool_calls": true,
         "reasoning": { "effort": reasoning_effort },
@@ -1441,21 +1452,22 @@ fn build_responses_request(
         "stream": true
     });
 
-    if let Ok(temp) = std::env::var("CUSTOM_TEMPERATURE") {
-        if let Ok(val) = temp.parse::<f64>() {
-            req["temperature"] = json!(val);
-        }
-    }
-
-    if let Ok(tp) = std::env::var("CUSTOM_TOP_P") {
-        if let Ok(val) = tp.parse::<f64>() {
-            req["top_p"] = json!(val);
-        }
-    }
-
     if let Ok(fmt) = std::env::var("TEXT_FORMAT") {
         if fmt == "json_object" {
             req["text"] = json!({ "format": { "type": "json_object" } });
+        } else if fmt == "json_schema" {
+            let schema_name = std::env::var("TEXT_SCHEMA_NAME").unwrap_or_else(|_| "custom_schema".to_string());
+            let schema_val: Value = std::env::var("TEXT_SCHEMA")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            req["text"] = json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema_val
+                }
+            });
         }
     }
 
@@ -1477,29 +1489,15 @@ fn build_responses_request(
 }
 
 fn build_anthropic_request(history: &[Value], model: &str, max_tokens: u64) -> Value {
-    let mut req = json!({
+    json!({
         "model": model,
         "max_tokens": max_tokens,
-        "system": get_system_instruction(),
+        "system": SYSTEM_INSTRUCTION,
         "messages": sanitize_history_anthropic(history),
         "tools": get_anthropic_tools(),
         "stream": true,
         "thinking": { "type": "enabled" }
-    });
-
-    if let Ok(temp) = std::env::var("CUSTOM_TEMPERATURE") {
-        if let Ok(val) = temp.parse::<f64>() {
-            req["temperature"] = json!(val);
-        }
-    }
-
-    if let Ok(tp) = std::env::var("CUSTOM_TOP_P") {
-        if let Ok(val) = tp.parse::<f64>() {
-            req["top_p"] = json!(val);
-        }
-    }
-
-    req
+    })
 }
 
 // ==========================================
@@ -1893,97 +1891,50 @@ fn expand_file_references(text: &str) -> String {
 }
 
 // ==========================================
-// 12. 自定义功能与协议端点解析
+// 12. 官方标准协议端点与凭证解析 (绝无非标前缀)
 // ==========================================
-fn apply_custom_headers(mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if let Ok(headers_str) = std::env::var("CUSTOM_HEADERS") {
-        let trimmed = headers_str.trim();
-        if trimmed.starts_with('{') {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) {
-                for (k, v) in map {
-                    if let Some(s) = v.as_str() {
-                        builder = builder.header(k, s);
-                    }
-                }
-            }
-        } else {
-            for item in trimmed.split(',') {
-                let mut parts = item.splitn(2, ':');
-                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                    let k = k.trim();
-                    let v = v.trim();
-                    if !k.is_empty() && !v.is_empty() {
-                        builder = builder.header(k, v);
-                    }
-                }
-            }
-        }
-    }
-    builder
-}
-
 fn get_protocol_config(protocol: Protocol) -> Result<(String, String), String> {
-    let custom_endpoint = std::env::var("CUSTOM_ENDPOINT").ok();
-    let custom_key = std::env::var("CUSTOM_API_KEY")
-        .or_else(|_| std::env::var("AI_API_KEY"))
-        .ok();
-    let custom_base = std::env::var("CUSTOM_BASE_URL")
-        .or_else(|_| std::env::var("AI_BASE_URL"))
-        .ok();
-
     match protocol {
         Protocol::Anthropic => {
             let key = std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .or(custom_key)
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .ok_or_else(|| "未配置 API 密钥，请设置 ANTHROPIC_API_KEY、CUSTOM_API_KEY 或 OPENAI_API_KEY".to_string())?
+                .or_else(|_| std::env::var("AI_API_KEY"))
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .map_err(|_| "未配置 ANTHROPIC_API_KEY 环境变量".to_string())?
                 .trim()
                 .to_string();
 
-            let endpoint = if let Some(ep) = custom_endpoint {
-                ep.trim().to_string()
-            } else {
-                let base = std::env::var("ANTHROPIC_BASE_URL")
-                    .ok()
-                    .or(custom_base)
-                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                let trimmed = base.trim().trim_end_matches('/');
+            let base = std::env::var("ANTHROPIC_BASE_URL")
+                .or_else(|_| std::env::var("AI_BASE_URL"))
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+            let trimmed = base.trim().trim_end_matches('/');
 
-                if trimmed.ends_with("/v1/messages") {
-                    trimmed.to_string()
-                } else if trimmed.ends_with("/v1") {
-                    format!("{}/messages", trimmed)
-                } else {
-                    format!("{}/v1/messages", trimmed)
-                }
+            let endpoint = if trimmed.ends_with("/v1/messages") {
+                trimmed.to_string()
+            } else if trimmed.ends_with("/v1") {
+                format!("{}/messages", trimmed)
+            } else {
+                format!("{}/v1/messages", trimmed)
             };
 
             Ok((key, endpoint))
         }
         Protocol::Responses => {
             let key = std::env::var("OPENAI_API_KEY")
-                .ok()
-                .or(custom_key)
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| "未配置 API 密钥，请设置 OPENAI_API_KEY、CUSTOM_API_KEY 或 ANTHROPIC_API_KEY".to_string())?
+                .or_else(|_| std::env::var("AI_API_KEY"))
+                .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+                .map_err(|_| "未配置 OPENAI_API_KEY 环境变量".to_string())?
                 .trim()
                 .to_string();
 
-            let endpoint = if let Some(ep) = custom_endpoint {
-                ep.trim().to_string()
-            } else {
-                let base = std::env::var("OPENAI_BASE_URL")
-                    .ok()
-                    .or(custom_base)
-                    .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-                let trimmed = base.trim().trim_end_matches('/');
+            let base = std::env::var("OPENAI_BASE_URL")
+                .or_else(|_| std::env::var("AI_BASE_URL"))
+                .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+            let trimmed = base.trim().trim_end_matches('/');
 
-                if trimmed.ends_with("/responses") {
-                    trimmed.to_string()
-                } else {
-                    format!("{}/responses", trimmed)
-                }
+            let endpoint = if trimmed.ends_with("/responses") {
+                trimmed.to_string()
+            } else {
+                format!("{}/responses", trimmed)
             };
 
             Ok((key, endpoint))
@@ -2003,21 +1954,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let has_key = std::env::var("ANTHROPIC_API_KEY").is_ok()
         || std::env::var("OPENAI_API_KEY").is_ok()
-        || std::env::var("CUSTOM_API_KEY").is_ok()
         || std::env::var("AI_API_KEY").is_ok();
     if !has_key {
-        eprintln!("\x1b[31m❌ 错误: 未检测到 API 密钥，请在环境变量中配置 ANTHROPIC_API_KEY、OPENAI_API_KEY 或 CUSTOM_API_KEY\x1b[0m");
+        eprintln!("\x1b[31m❌ 错误: 未检测到 API 密钥，请在环境变量中配置 ANTHROPIC_API_KEY 或 OPENAI_API_KEY\x1b[0m");
         std::process::exit(1);
     }
 
-    let model = std::env::var("CUSTOM_MODEL")
-        .or_else(|_| std::env::var("MODEL_NAME"))
+    let model = std::env::var("MODEL_NAME")
         .or_else(|_| std::env::var("AI_MODEL"))
         .unwrap_or_else(|_| "deepseek-v4-flash-vision-exp".to_string());
 
     let reasoning_effort = std::env::var("REASONING_EFFORT").unwrap_or_else(|_| "medium".to_string());
     let max_retries = std::env::var("MAX_RETRIES").unwrap_or_else(|_| "3".to_string()).parse::<usize>().unwrap_or(3);
-    let max_output_tokens = std::env::var("MAX_OUTPUT_TOKENS").unwrap_or_else(|_| "8192".to_string()).parse::<u64>().unwrap_or(8192);
+    let max_output_tokens = std::env::var("MAX_OUTPUT_TOKENS").unwrap_or_else(|_| "64000".to_string()).parse::<u64>().unwrap_or(64000);
     let mut enable_web_search = std::env::var("ENABLE_WEB_SEARCH").map(|v| v != "false").unwrap_or(true);
 
     let client = Client::builder()
@@ -2304,8 +2253,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .header("Authorization", format!("Bearer {}", api_key))
                         .header("User-Agent", "OpenAI/NodeJS");
                 }
-
-                req_builder = apply_custom_headers(req_builder);
 
                 let res = req_builder.send().await;
 
